@@ -16,11 +16,14 @@ from inference_sdk import InferenceHTTPClient
 # ---------- CONFIG DI DEFAULT ----------
 DEFAULT_API_URL  = "http://localhost:9001"
 DEFAULT_API_KEY  = "EC9puzE6crcRm7buAF1S"   # <-- sostituisci se necessario
-DEFAULT_MODEL_ID = "big400-body-insp-before-cleaning-7cr8v/3"
-DEFAULT_TH       = 0.6                      # soglia confidenza
-DURATION_S       = 6.0
+DEFAULT_MODEL_ID = "big400-body-insp-before-cleaning-7cr8v/4"
+DEFAULT_TH       = 0.8                      # soglia confidenza
+DURATION_S       = 3.0
 INFER_MAX_W      = 1280
 INFER_EVERY_N    = 1
+
+# remembre that you can choose the acquisisn frame rate
+#cam.MV_CC_SetFloatValue("AcquisitionFrameRate", 25.0)
 
 # ---------- UI ----------
 WIN_NAME    = "Body Inspection - HIK + Roboflow (q per uscire)"
@@ -136,7 +139,7 @@ def hik_close(cam):
 # ====== ARGPARSE ======
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam-index", type=int, default=1, help="Indice HIK (default 1)")
+    ap.add_argument("--cam-index", type=int, default=2, help="Indice HIK (default 1)")
     ap.add_argument("--api-url", default=os.getenv("RF_API_URL", DEFAULT_API_URL))
     ap.add_argument("--api-key", default=os.getenv("RF_API_KEY", DEFAULT_API_KEY))
     ap.add_argument("--model",   default=os.getenv("RF_MODEL_ID", DEFAULT_MODEL_ID))

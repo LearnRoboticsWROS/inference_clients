@@ -153,7 +153,7 @@ def hik_close(cam):
 # ====== ARGPARSE ======
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam-index", type=int, default=2, help="Indice HIK (default 2 per Body-CL)")
+    ap.add_argument("--cam-index", type=int, default=1, help="Indice HIK (default 2 per Body-CL)")
     ap.add_argument("--api-url", default=os.getenv("RF_API_URL", DEFAULT_API_URL))
     ap.add_argument("--api-key", default=os.getenv("RF_API_KEY", DEFAULT_API_KEY))
     ap.add_argument("--model",   default=os.getenv("RF_MODEL_ID", DEFAULT_MODEL_ID))

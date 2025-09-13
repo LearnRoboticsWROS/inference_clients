@@ -15,12 +15,15 @@ from inference_sdk import InferenceHTTPClient
 
 # ---------- CONFIG DI DEFAULT ----------
 DEFAULT_API_URL  = "http://localhost:9001"
-DEFAULT_API_KEY  = "EC9puzE6crcRm7buAF1S"   # <-- sostituisci se necessario
+DEFAULT_API_KEY  = "EC9puzE6crcRm7buAF1S"     # <-- sostituisci se necessario
 DEFAULT_MODEL_ID = "big400-lip-insp-before-cleaning-da2vm/4"
-DEFAULT_TH       = 0.18                      # soglia confidenza per contare difetto
-DURATION_S       = 6.0                      # finestra temporale
-INFER_MAX_W      = 1280                     # ridimensionamento (aspect-preserving)
-INFER_EVERY_N    = 1                        # 1 = inferenza ad ogni frame
+DEFAULT_TH       = 0.80                        # soglia confidenza per contare difetto
+DURATION_S       = 3.0                         # finestra temporale
+INFER_MAX_W      = 1280                        # ridimensionamento (aspect-preserving)
+INFER_EVERY_N    = 1                           # 1 = inferenza ad ogni frame
+DEFAULT_FPS      = 25.0                        # fps richiesti alla camera
+DEFAULT_EXPO_US  = 10000.0                      # exposure time (µs)
+DEFAULT_GAIN     = 0.0                         # gain manuale (unità tipicamente dB su HIK)
 
 # ---------- UI ----------
 WIN_NAME    = "Lip Inspection - HIK + Roboflow (q per uscire)"
@@ -47,7 +50,6 @@ def frame_to_bgr(stOutFrame):
     raise RuntimeError(f"PixelType non gestito: 0x{pt:x}. Imposta Mono8 o aggiungi demosaic.")
 
 def normalize_conf(c):
-    """Supporta conf in [0..1] o [0..100]."""
     try:
         conf = float(c)
     except Exception:
@@ -58,36 +60,27 @@ def draw_info(img, txt):
     cv2.putText(img, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
 
 def draw_predictions(img, preds, th: float, ok_classes: Optional[List[str]] = None):
-    """Disegna box SOLO per predizioni con confidenza >= th.
-       Verde se la classe è in whitelist (logo/logo_front), rosso altrimenti.
-    """
     if not preds or "predictions" not in preds:
         return
     wl = set([c.strip().lower() for c in (ok_classes or []) if c.strip()]) if ok_classes else set()
     h, w = img.shape[:2]
-
     for p in preds["predictions"]:
         conf = normalize_conf(p.get("confidence", 0.0))
         if conf < th:
-            continue  # non disegnare sotto soglia
-
+            continue
         x = p.get("x"); y = p.get("y")
         ww = p.get("width"); hh = p.get("height")
         cls = p.get("class", "obj")
         if None in (x, y, ww, hh):
             continue
-
         x_min = int(x - ww/2); y_min = int(y - hh/2)
         x_max = int(x + ww/2); y_max = int(y + hh/2)
         x_min = clamp(x_min, 0, w-1); y_min = clamp(y_min, 0, h-1)
         x_max = clamp(x_max, 0, w-1); y_max = clamp(y_max, 0, h-1)
-
         cls_norm = str(cls).lower().replace(" ", "")
         color = (0, 255, 0) if cls_norm in wl else (0, 0, 255)
-
         cv2.rectangle(img, (x_min, y_min), (x_max, y_max), color, 2)
-        cv2.putText(img, f"{cls} {conf:.2f}",
-                    (x_min, max(0, y_min-8)),
+        cv2.putText(img, f"{cls} {conf:.2f}", (x_min, max(0, y_min-8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
 def any_defect(preds, th: float, ok_classes: Optional[List[str]], debug: bool = False):
@@ -105,26 +98,73 @@ def any_defect(preds, th: float, ok_classes: Optional[List[str]], debug: bool = 
             return True
     return False
 
-# ====== HIK helpers ======
-def hik_open_by_index(idx: int):
+
+# ====== HIK helpers: Exposure & Gain ======
+def set_exposure_us(cam, us):
+    try:
+        cam.MV_CC_SetEnumValue("ExposureAuto", 0)  # 0=Off
+    except:
+        pass
+    cam.MV_CC_SetFloatValue("ExposureTime", float(us))
+
+def get_exposure_us(cam):
+    try:
+        val = MVCC_FLOATVALUE()
+        memset(byref(val), 0, sizeof(MVCC_FLOATVALUE))
+        if cam.MV_CC_GetFloatValue("ExposureTime", val) == 0:
+            return val.fCurValue
+    except:
+        pass
+    return None
+
+def set_gain(cam, gain_val):
+    """Imposta gain manuale e disabilita auto-gain.
+       Sulle HIK: 'GainAuto' (0=Off), 'Gain' (float, spesso in dB)."""
+    try:
+        cam.MV_CC_SetEnumValue("GainAuto", 0)  # 0=Off
+    except:
+        pass
+    cam.MV_CC_SetFloatValue("Gain", float(gain_val))
+
+def get_gain(cam):
+    try:
+        val = MVCC_FLOATVALUE()
+        memset(byref(val), 0, sizeof(MVCC_FLOATVALUE))
+        if cam.MV_CC_GetFloatValue("Gain", val) == 0:
+            return val.fCurValue
+    except:
+        pass
+    return None
+
+def hik_open_by_index(idx: int, fps: float, exposure_us: float, gain_val: float):
     deviceList = MV_CC_DEVICE_INFO_LIST()
     ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, deviceList)
     if ret != 0 or deviceList.nDeviceNum == 0:
         raise RuntimeError(f"Enum devices fail or no device! ret=0x{ret:x}")
     if idx >= deviceList.nDeviceNum:
         raise RuntimeError(f"Device index {idx} out of range (found {deviceList.nDeviceNum})")
+
     cam = MvCamera()
     stDeviceList = cast(deviceList.pDeviceInfo[idx], POINTER(MV_CC_DEVICE_INFO)).contents
     if cam.MV_CC_CreateHandle(stDeviceList) != 0:
         raise RuntimeError("Create handle fail")
     if cam.MV_CC_OpenDevice(MV_ACCESS_Exclusive, 0) != 0:
         raise RuntimeError("Open device fail (già aperta?)")
+
     cam.MV_CC_SetEnumValue("TriggerMode", MV_TRIGGER_MODE_OFF)
     cam.MV_CC_SetEnumValue("PixelFormat", PIXEL_MONO8)
+
+    # FPS richiesto
     try:
         cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
-        cam.MV_CC_SetFloatValue("AcquisitionFrameRate", 25.0)
-    except: pass
+        cam.MV_CC_SetFloatValue("AcquisitionFrameRate", float(fps))
+    except:
+        pass
+
+    # >>> impostazioni manuali principali
+    set_exposure_us(cam, exposure_us)
+    set_gain(cam, gain_val)
+
     if cam.MV_CC_StartGrabbing() != 0:
         cam.MV_CC_CloseDevice(); cam.MV_CC_DestroyHandle()
         raise RuntimeError("Start grabbing fail")
@@ -162,6 +202,14 @@ def parse_args():
     ap.add_argument("--save-last", default=None, help="Se settato, salva ultimo frame annotato (JPG)")
     ap.add_argument("--debug", action="store_true", help="Logga classi/confidenze su stderr")
 
+    # Parametri camera espliciti
+    ap.add_argument("--fps", type=float, default=DEFAULT_FPS,
+                    help="Frame rate richiesto alla camera (default 25.0)")
+    ap.add_argument("--exposure-us", type=float, default=DEFAULT_EXPO_US,
+                    help="Exposure time fisso in microsecondi (default 5000.0)")
+    ap.add_argument("--gain", type=float, default=DEFAULT_GAIN,
+                    help="Gain manuale (tipicamente dB su HIK). Default 5.0")
+
     # modalità daemon (finestre sempre aperte + trigger/result file)
     ap.add_argument("--daemon", action="store_true",
                     help="Keep camera+window open; wait for trigger-file to run a 6s inference")
@@ -176,13 +224,22 @@ def main():
     args = parse_args()
     ok_classes = [s.strip().lower() for s in args.ok_classes.split(",")] if args.ok_classes else []
 
-    # Client Roboflow
     client = InferenceHTTPClient(api_url=args.api_url, api_key=args.api_key)
+
+    # Warning se exposure supera il periodo frame
+    try:
+        period_us = 1e6 / float(args.fps)
+        if args.exposure_us > period_us:
+            print(f"[WARN] Exposure ({args.exposure_us} µs) > frame period ~{int(period_us)} µs @ {args.fps:.1f} FPS.",
+                  file=sys.stderr)
+    except:
+        pass
 
     # HIK init
     MvCamera.MV_CC_Initialize()
     try:
-        cam = hik_open_by_index(args.cam_index)
+        cam = hik_open_by_index(args.cam_index, fps=args.fps,
+                                exposure_us=args.exposure_us, gain_val=args.gain)
     except Exception as e:
         print(f"[{PREFIX}] open error: {e}", file=sys.stderr)
         MvCamera.MV_CC_Finalize()
@@ -193,7 +250,7 @@ def main():
         cv2.resizeWindow(WIN_NAME, 1280, 800)
 
         if not args.daemon:
-            # ====== Modalità ONE-SHOT: 6s e termina ======
+            # ====== ONE-SHOT: 6s ======
             t0 = time.time()
             frame_id = 0
             found_defect = False
@@ -202,8 +259,7 @@ def main():
             while (time.time() - t0) < args.duration:
                 img = hik_grab_one(cam, timeout_ms=800)
                 if img is None:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'): break
+                    if (cv2.waitKey(1) & 0xFF) == ord('q'): break
                     continue
 
                 frame_id += 1
@@ -222,7 +278,12 @@ def main():
                     if any_defect(preds, th=args.th, ok_classes=ok_classes, debug=args.debug):
                         found_defect = True
 
-                draw_info(view, f"[{int((time.time()-t0)*1000)}ms/{int(args.duration*1000)}ms] TH={args.th}")
+                expo_now = get_exposure_us(cam)
+                gain_now = get_gain(cam)
+                draw_info(view, f"[{int((time.time()-t0)*1000)}ms/{int(args.duration*1000)}ms] "
+                                f"TH={args.th}  FPS={args.fps:.1f}  "
+                                f"EXP={int(expo_now) if expo_now else int(args.exposure_us)}us  "
+                                f"GAIN={gain_now if gain_now is not None else args.gain:.1f}")
                 cv2.imshow(WIN_NAME, view)
                 last_view = view
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
@@ -237,17 +298,20 @@ def main():
             sys.exit(0)
 
         else:
-            # ====== Modalità DAEMON: preview continua; esegue finestra 6s quando compare il trigger file ======
+            # ====== DAEMON ======
             print(f"[{PREFIX}] DAEMON mode. Trigger='{args.trigger_file}'  Result='{args.result_file}'")
-            last_idle_ts = time.time()
             while True:
                 img = hik_grab_one(cam, timeout_ms=800)
                 if img is not None:
                     view, _ = resize_keep_aspect(img, INFER_MAX_W)
-                    draw_info(view, "[IDLE] waiting trigger")
+                    expo_now = get_exposure_us(cam)
+                    gain_now = get_gain(cam)
+                    draw_info(view, f"[IDLE] FPS={args.fps:.1f}  "
+                                    f"EXP={int(expo_now) if expo_now else int(args.exposure_us)}us  "
+                                    f"GAIN={gain_now if gain_now is not None else args.gain:.1f}")
                     cv2.imshow(WIN_NAME, view)
 
-                # se esiste il trigger file: esegui una finestra
+                # trigger -> finestra 6s
                 if os.path.exists(args.trigger_file):
                     try: os.remove(args.trigger_file)
                     except: pass
@@ -256,7 +320,7 @@ def main():
                     frame_id = 0
                     found_defect = False
                     last_view = None
-                    while (time.time() - t0) < args.duration:
+                    while (time.time() - t0) < DURATION_S:
                         img = hik_grab_one(cam, timeout_ms=800)
                         if img is None:
                             if (cv2.waitKey(1) & 0xFF) == ord('q'):
@@ -279,21 +343,25 @@ def main():
                             if any_defect(preds, th=args.th, ok_classes=ok_classes, debug=args.debug):
                                 found_defect = True
 
-                        draw_info(view, f"[RUN {int(time.time()-t0)}s] TH={args.th}")
+                        expo_now = get_exposure_us(cam)
+                        gain_now = get_gain(cam)
+                        draw_info(view, f"[RUN {int(time.time()-t0)}s] TH={args.th}  "
+                                        f"FPS={args.fps:.1f}  "
+                                        f"EXP={int(expo_now) if expo_now else int(args.exposure_us)}us  "
+                                        f"GAIN={gain_now if gain_now is not None else args.gain:.1f}")
                         cv2.imshow(WIN_NAME, view)
                         last_view = view
                         if (cv2.waitKey(1) & 0xFF) == ord('q'):
                             break
 
                     token = "LIP_NOK" if found_defect else "LIP_OK"
-                    print(token)  # anche su stdout
+                    print(token)
                     try:
                         with open(args.result_file, "w") as f:
                             f.write(token + "\n")
                     except Exception as e:
                         print(f"[{PREFIX}] write result-file error: {e}", file=sys.stderr)
 
-                # gestione uscita manuale
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
 
@@ -307,4 +375,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
