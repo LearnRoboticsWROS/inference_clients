@@ -1,4 +1,11 @@
-.venv
-.venv-orch
-__pycache__
+# venv
+.venv/
+.venv-orch/
+
+# python
+__pycache__/
 *.pyc
+
+# windows leftovers
+System Volume Information/
+
