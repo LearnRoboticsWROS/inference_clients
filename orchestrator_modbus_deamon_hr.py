@@ -179,6 +179,8 @@ def do_inference_cycle(ctx: ModbusServerContext, args):
     lip_tok   = tokens.get("LIP", "LIP_ERROR")
     body_tok  = tokens.get("BODY", "BODY_ERROR")
     bodycl_tok= tokens.get("BODY_CL", "") if ("BODY_CL" in tokens) else ""
+    print(f"[ORCH] inference elapsed = {_elapsed:.3f}s", flush=True)
+
 
     # token -> HR mapping
     def tok_to_hr(tok: str, prefix: str) -> int:

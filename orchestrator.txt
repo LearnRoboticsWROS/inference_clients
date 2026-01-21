@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Orchestratore Modbus DEBUG (DAEMON) - TUTTO SU HOLDING REGISTERS (HR)
+Jetson = Modbus TCP Server (default 0.0.0.0:5020)
+PLC    = Modbus TCP Client
+"""
+
+import os, sys, time, threading, argparse
+from queue import Queue, Empty
+from typing import List, Dict, Tuple
+from pymodbus.server.sync import StartTcpServer
+from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext, ModbusSequentialDataBlock
+
+# ====== TIMEOUTS ======
+RESULT_TIMEOUT_S = 15.0
+ACK_TIMEOUT_S    = 10.0
+
+# ====== MODBUS ======
+BIND_IP   = "0.0.0.0"
+BIND_PORT = 5020
+
+# ====== HR INDICI (0-based) ======
+HR_START       = 0
+HR_ACK         = 1
+HR_BUSY        = 2
+HR_READY       = 3
+HR_ERROR       = 4
+HR_LIP         = 5
+HR_BODY        = 6
+HR_BODY_CL     = 7
+HR_ERR_CODE    = 8
+
+# ====== ERROR CODES ======
+ERR_NONE    = 0
+ERR_TIMEOUT = 2
+ERR_CLIENT  = 3
+ERR_INFER   = 4
+
+# ====== Trigger/Result files ======
+LIP_TRIGGER_DEFAULT     = "/tmp/lip_go"
+LIP_RESULT_DEFAULT      = "/tmp/lip_res"
+BODY_TRIGGER_DEFAULT    = "/tmp/body_go"
+BODY_RESULT_DEFAULT     = "/tmp/body_res"
+BODYCL_TRIGGER_DEFAULT  = "/tmp/bodycl_go"
+BODYCL_RESULT_DEFAULT   = "/tmp/bodycl_res"
+
+# ---------- DataBlock con logging ----------
+class LoggingDataBlock(ModbusSequentialDataBlock):
+    def __init__(self, address: int, values: List[int], name: str):
+        super().__init__(address, values)
+        self.name = name
+        self.on_write = None
+
+    def setValues(self, address, values):
+        super().setValues(address, values)
+        if self.on_write:
+            try:
+                self.on_write(self.name, address, list(values))
+            except Exception as e:
+                print(f"[DataBlock][{self.name}] on_write error: {e}", file=sys.stderr)
+
+# ---------- Helpers HR ----------
+def set_hr(ctx: ModbusServerContext, idx: int, val: int):
+    ctx[0x00].setValues(3, idx, [int(val)])
+
+def get_hr(ctx: ModbusServerContext, idx: int, count: int = 1) -> List[int]:
+    return ctx[0x00].getValues(3, idx, count)
+
+# ---------- Server thread ----------
+def start_modbus_server(context: ModbusServerContext, bind_ip: str, bind_port: int):
+    t = threading.Thread(
+        target=StartTcpServer,
+        kwargs={"context": context, "address": (bind_ip, bind_port)},
+        daemon=True
+    )
+    t.start()
+    return t
+
+# ---------- Keyboard (simulazione PLC) ----------
+def keyboard_thread(q: Queue):
+    print(">> Keyboard: '1' = START_CAPTURE, 'r' = ACK_RESET, 'q' = quit")
+    while True:
+        try:
+            s = input().strip().lower()
+        except EOFError:
+            break
+        if s in ("1","r","q"):
+            q.put(s)
+        else:
+            print("  (unknown command, use 1/r/q)")
+
+# ---------- File helpers ----------
+def touch(path: str):
+    with open(path, "w") as f:
+        f.write("go\n")
+
+def cleanup(paths: List[str]):
+    for p in paths:
+        try: os.remove(p)
+        except: pass
+
+# ---------- Attesa PARALLELA dei risultati ----------
+def wait_results_parallel(pairs: List[Tuple[str, str]], timeout_s: float) -> Tuple[Dict[str, str], float]:
+    t0 = time.time()
+    seen: Dict[str, bool] = {name: False for name, _ in pairs}
+    tokens: Dict[str, str] = {name: "" for name, _ in pairs}
+    while (time.time() - t0) <= timeout_s:
+        all_seen = True
+        for name, path in pairs:
+            if not seen[name]:
+                all_seen = False
+                if os.path.exists(path):
+                    try:
+                        with open(path, "r") as f:
+                            tok = (f.readline() or "").strip()
+                        tokens[name] = tok
+                        seen[name] = True
+                        print(f"[ORCH] {name} result arrived: {tok}")
+                    except:
+                        pass
+        if all_seen:
+            break
+        time.sleep(0.01)
+    for name in seen:
+        if not seen[name]:
+            tokens[name] = f"{name}_ERROR"
+            print(f"[ORCH] {name} result missing (timeout)")
+    return tokens, (time.time() - t0)
+
+# ---------- Core cycle ----------
+def do_inference_cycle(ctx: ModbusServerContext, args):
+    if get_hr(ctx, HR_BUSY, 1)[0] == 1:
+        set_hr(ctx, HR_START, 0)
+        print("[ORCH] START ignored: BUSY already 1")
+        return
+    print("[ORCH] START received -> triggering daemon clients")
+
+    # Reset HR and state
+    set_hr(ctx, HR_ERROR,    0)
+    set_hr(ctx, HR_READY,    0)
+    set_hr(ctx, HR_LIP,      0)
+    set_hr(ctx, HR_BODY,     0)
+    set_hr(ctx, HR_BODY_CL,  0)
+    set_hr(ctx, HR_ERR_CODE, ERR_NONE)
+    set_hr(ctx, HR_BUSY, 1)
+    set_hr(ctx, HR_START, 0)
+
+    # Clean previous results
+    to_clean = [args.lip_result, args.body_result]
+    pairs = [("LIP", args.lip_result), ("BODY", args.body_result)]
+    if args.bodycl_result:
+        to_clean.append(args.bodycl_result)
+        pairs.append(("BODY_CL", args.bodycl_result))
+    cleanup(to_clean)
+
+    # Trigger clients
+    try: touch(args.lip_trigger);  print(f"[ORCH] -> LIP trigger: {args.lip_trigger}")
+    except: pass
+    try: touch(args.body_trigger); print(f"[ORCH] -> BODY trigger: {args.body_trigger}")
+    except: pass
+    if args.bodycl_trigger:
+        try: touch(args.bodycl_trigger); print(f"[ORCH] -> BODY_CL trigger: {args.bodycl_trigger}")
+        except: pass
+
+    # Wait results in parallel
+    tokens, elapsed = wait_results_parallel(pairs, args.timeout)
+    lip_hr   = 1 if tokens.get("LIP","")=="LIP_OK" else 2 if tokens.get("LIP","")=="LIP_NOK" else 0
+    body_hr  = 1 if tokens.get("BODY","")=="BODY_OK" else 2 if tokens.get("BODY","")=="BODY_NOK" else 0
+    bodycl_hr= 1 if tokens.get("BODY_CL","")=="BODY_CL_OK" else 2 if tokens.get("BODY_CL","")=="BODY_CL_NOK" else 0
+
+    set_hr(ctx, HR_LIP,     lip_hr)
+    set_hr(ctx, HR_BODY,    body_hr)
+    set_hr(ctx, HR_BODY_CL, bodycl_hr)
+
+    # Error detection
+    err_code = ERR_NONE
+    if lip_hr==0 or body_hr==0 or (("BODY_CL" in tokens) and bodycl_hr==0):
+        timeout_condition = False
+        if tokens.get("LIP")=="LIP_ERROR" and not os.path.exists(args.lip_result): timeout_condition=True
+        if tokens.get("BODY")=="BODY_ERROR" and not os.path.exists(args.body_result): timeout_condition=True
+        if ("BODY_CL" in tokens) and tokens.get("BODY_CL")=="BODY_CL_ERROR" and not os.path.exists(args.bodycl_result):
+            timeout_condition=True
+        err_code = ERR_TIMEOUT if timeout_condition else ERR_INFER
+
+    # Immediately publish READY/BUSY/ERROR
+    set_hr(ctx, HR_ERR_CODE, err_code)
+    set_hr(ctx, HR_BUSY,  0)
+    set_hr(ctx, HR_READY, 1)
+    set_hr(ctx, HR_ERROR, 1 if err_code!=ERR_NONE else 0)
+
+    print(f"[ORCH] -> HRs: LIP={lip_hr}, BODY={body_hr}, BODY_CL={bodycl_hr}, ERR_CODE={err_code}, BUSY=0 READY=1 ERROR={(1 if err_code else 0)}")
+
+    # Start ACK wait in background thread
+    def ack_wait_thread():
+        t_ack = time.time()
+        while True:
+            if get_hr(ctx, HR_ACK, 1)[0]==1:
+                print("[ORCH] ACK received.")
+                break
+            if (time.time()-t_ack) > args.ack_timeout:
+                print("[ORCH] ACK timeout -> auto-reset (safety).")
+                break
+            time.sleep(0.01)
+
+        # Reset post-ACK
+        set_hr(ctx, HR_ACK,      0)
+        set_hr(ctx, HR_READY,    0)
+        set_hr(ctx, HR_LIP,      0)
+        set_hr(ctx, HR_BODY,     0)
+        set_hr(ctx, HR_BODY_CL,  0)
+        set_hr(ctx, HR_ERR_CODE, ERR_NONE)
+        set_hr(ctx, HR_ERROR,    0)
+        cleanup(to_clean)
+        print("[ORCH] Reset done. Back to IDLE.")
+
+    threading.Thread(target=ack_wait_thread, daemon=True).start()
+
+# ---------- Threaded watcher ----------
+def inference_thread(ctx: ModbusServerContext, args):
+    while True:
+        if get_hr(ctx, HR_START, 1)[0]==1:
+            do_inference_cycle(ctx, args)
+        time.sleep(0.01)
+
+# ---------- Main ----------
+def main():
+    ap = argparse.ArgumentParser(description="Orchestratore Modbus (daemon) - tutto su HR")
+    ap.add_argument("--bind-ip", default=BIND_IP)
+    ap.add_argument("--bind-port", type=int, default=BIND_PORT)
+    ap.add_argument("--timeout", type=float, default=RESULT_TIMEOUT_S)
+    ap.add_argument("--ack-timeout", type=float, default=ACK_TIMEOUT_S)
+    ap.add_argument("--lip-trigger",   default=LIP_TRIGGER_DEFAULT)
+    ap.add_argument("--lip-result",    default=LIP_RESULT_DEFAULT)
+    ap.add_argument("--body-trigger",  default=BODY_TRIGGER_DEFAULT)
+    ap.add_argument("--body-result",   default=BODY_RESULT_DEFAULT)
+    ap.add_argument("--bodycl-trigger", default=BODYCL_TRIGGER_DEFAULT)
+    ap.add_argument("--bodycl-result",  default=BODYCL_RESULT_DEFAULT)
+    args = ap.parse_args()
+
+    # Datastore
+    hr_block = LoggingDataBlock(0, [0]*32, "HR")
+    di_block = LoggingDataBlock(0, [0]*1, "DI")
+    co_block = LoggingDataBlock(0, [0]*1, "COIL")
+    ir_block = LoggingDataBlock(0, [0]*1, "IR")
+
+    def on_write(name, address, values):
+        if name=="HR":
+            print(f"[PLC->MODBUS] WRITE {name} addr={address} values={values}")
+    hr_block.on_write = on_write
+
+    store = ModbusSlaveContext(di=di_block, co=co_block, hr=hr_block, ir=ir_block)
+    context = ModbusServerContext(slaves=store, single=True)
+
+    # Stato iniziale
+    for idx in range(0,9):
+        set_hr(context, idx, 0)
+
+    start_modbus_server(context, args.bind_ip, args.bind_port)
+    print(f"[SERVER] Modbus TCP listening on {args.bind_ip}:{args.bind_port}")
+
+    q = Queue()
+    tk = threading.Thread(target=keyboard_thread, args=(q,), daemon=True)
+    tk.start()
+
+    t_inf = threading.Thread(target=inference_thread, args=(context, args), daemon=True)
+    t_inf.start()
+
+    try:
+        while True:
+            try:
+                cmd = q.get_nowait()
+                if cmd=="q":
+                    print("[ORCH] Quit requested.")
+                    break
+                elif cmd=="1":
+                    set_hr(context, HR_START, 1)
+                elif cmd=="r":
+                    set_hr(context, HR_ACK, 1)
+            except Empty:
+                pass
+            time.sleep(0.005)
+    except KeyboardInterrupt:
+        print("\n[ORCH] CTRL-C -> exit.")
+    finally:
+        print("[ORCH] Bye.")
+
+if __name__=="__main__":
+    main()

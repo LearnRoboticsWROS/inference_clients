@@ -1,69 +1,69 @@
 DEBUGGING MODE IN DEAMON (if you want to test the inference client, just run the code lip_client.py and body_client.py after having activate the .venv):
 
     Start the Body Client in deamon mode:
-        python /home/bewater/big400_bottle_inspection/inference_clients/body_client.py \
+        python /home/nvidia/big400_bottle_inspection/inference_clients/body_client.py \
             --daemon \
-            --cam-index 2 \
+            --cam-index 0 \
             --api-url http://localhost:9001 \
             --api-key EC9puzE6crcRm7buAF1S \
-            --model big400-body-insp-before-cleaning-7cr8v/2 \
-            --th 0.4 \
+            --model big400-body-insp-before-cleaning-7cr8v/8 \
+            --th 0.90\
             --trigger-file /tmp/body_go \
             --result-file /tmp/body_res
 
         OR, if you don't want to set model and threshold of confidence run:
         python body_client.py \
-            --daemon --cam-index 2 \
+            --daemon --cam-index 1 \
             --trigger-file /tmp/body_go --result-file /tmp/body_res
 
     Start the Lip Client in deamon mode:
-        python /home/bewater/big400_bottle_inspection/inference_clients/lip_client.py \
+        python /home/nvidia/big400_bottle_inspection/inference_clients/lip_client.py \
             --daemon \
-            --cam-index 0 \
+            --cam-index 2 \
             --api-url http://localhost:9001 \
             --api-key EC9puzE6crcRm7buAF1S \
-            --model big400-lip-insp-before-cleaning-da2vm/1 \
-            --th 0.4 \
+            --model big400-lip-insp-before-cleaning-da2vm/9 \
+            --th 0.10\
             --trigger-file /tmp/lip_go \
             --result-file /tmp/lip_res
 
         OR, if you don't want to set model and threshold of confidence run:
-        python lip_client.py --daemon --cam-index 0 \
+        python lip_client.py --daemon --cam-index 2 \
             --exposure-us 5000 --gain 5 --fps 25 \
             --trigger-file /tmp/lip_go --result-file /tmp/lip_res
 
         If you want to run by alternating exposure time run:
         python lip_alternate_exp_mod_client.py \
-            --daemon --cam-index 0 \
+            --daemon --cam-index 2 \
             --fps 20 --infer-every-n 1 \
             --trigger-file /tmp/lip_go --result-file /tmp/lip_res
 
 
     Start the Body Client after cleaning in deamon mode:
-        python /home/bewater/big400_bottle_inspection/inference_clients/body_cl_client.py \
+        python /home/nvidia/big400_bottle_inspection/inference_clients/body_cl_client.py \
             --daemon --cam-index 1 \
             --api-url http://localhost:9001 \
-            --model big400-lip-insp-before-cleaning-da2vm/4 \
-            --th 0.18 \
+            --model big400-lip-insp-before-cleaning-da2vm/8 \
+            --th 0.95\
             --trigger-file /tmp/bodycl_go \
             --result-file  /tmp/bodycl_res
 
         OR, if you don't want to set model and threshold of confidence run:        
-        python /home/bewater/big400_bottle_inspection/inference_clients/body_cl_client.py \
-            --daemon --cam-index 1 \
+        python /home/nvidia/big400_bottle_inspection/inference_clients/body_cl_client.py \
+            --daemon --cam-index 0 \
             --trigger-file /tmp/bodycl_go --result-file /tmp/bocycl_res
 
 
 
     Start the Orchestrator in deamon mode debug (meaning simulating PLC)
-        python /home/bewater/big400_bottle_inspection/inference_clients/orchestrator_modbus_debug_deamon_hr.py \
+        python /home/nvidia/big400_bottle_inspection/inference_clients/orchestrator_modbus_debug_deamon_hr.py \
             --bind-ip 0.0.0.0 --bind-port 5020 \
             --timeout 7 --ack-timeout 2
 
     OR, if you have PLC ready for sending request
         python orchestrator_modbus_deamon_hr.py \
             --bind-ip 0.0.0.0 --bind-port 5020 \
-            --timeout 7 --ack-timeout 2 \
+            --timeout 3.5 --ack-timeout 1.5 \
             --lip-trigger /tmp/lip_go   --lip-result /tmp/lip_res \
             --body-trigger /tmp/body_go --body-result /tmp/body_res \
             --bodycl-trigger /tmp/bodycl_go --bodycl-result /tmp/bodycl_res

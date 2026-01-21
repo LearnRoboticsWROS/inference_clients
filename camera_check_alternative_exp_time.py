@@ -19,9 +19,9 @@ ZOOM_MIN, ZOOM_MAX = 0.10, 2.00
 WIN_NAME = "Hikrobot (q: esci, f: fit/zoom, +/-: zoom) [expo auto-toggle]"
 
 # ----- EXPOSURE TOGGLE -----
-EXPO_HIGH_US   = 5000.0      # µs
+EXPO_HIGH_US   = 500.0      # µs
 EXPO_LOW_US    = 500.0       # µs
-SWITCH_PERIOD  = 0.5         # secondi: 1s high, 1s low, ...
+SWITCH_PERIOD  = 0.1         # secondi: 1s high, 1s low, ...
 
 def clamp(v, vmin, vmax):
     return max(vmin, min(v, vmax))
